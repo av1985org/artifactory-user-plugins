@@ -14,22 +14,28 @@
  * limitations under the License.
  */
 
+import groovy.json.JsonBuilder
+import groovy.json.JsonSlurper
+import org.artifactory.addon.p2.P2Repo
+import org.artifactory.descriptor.config.CentralConfigDescriptor
+import org.artifactory.descriptor.repo.RepoType
+import org.artifactory.repo.RepoPathFactory
+import org.artifactory.resource.ResourceStreamHandle
+import org.artifactory.ui.rest.model.admin.configuration.repository.virtual.VirtualRepositoryConfigModel
+import org.artifactory.ui.rest.service.admin.configuration.repositories.util.UpdateRepoConfigHelper
+import org.artifactory.ui.rest.service.admin.configuration.repositories.util.builder.RepoConfigModelBuilder
+
 /**
+ * Test with
+ * curl -uadmin:password -X POST "http://localhost:8081/artifactory/api/plugins/execute/getP2Urls?params=repo=repoKey"
+ *
+ * and
+ * curl -uadmin:password -X POST --data-binary "{\"repo\": \"repoKey\",
+ \"urls\": [ "", "" ]}" http://localhost:8080/artifactory/api/plugins/execute/modifyP2Urls
  *
  * @author Michal Reuven
  * @since 12/10/14
  */
-
-
-import groovy.json.JsonBuilder
-import groovy.json.JsonSlurper
-import org.artifactory.descriptor.config.CentralConfigDescriptor
-import org.artifactory.descriptor.config.MutableCentralConfigDescriptor
-import org.artifactory.descriptor.repo.P2Configuration
-import org.artifactory.descriptor.repo.RepoLayout
-import org.artifactory.repo.RepoPathFactory
-import org.artifactory.resource.ResourceStreamHandle
-
 
 /**
  ************************************************************************************
@@ -37,19 +43,7 @@ import org.artifactory.resource.ResourceStreamHandle
  ************************************************************************************
  */
 
-/**
- * Test with
- * curl -uadmin:password -X POST "http://localhost:8081/artifactory/api/plugins/execute/getP2Urls?params=repo=repoKey"
- *
- * and
- * curl -uadmin:password -X POST --data-binary "{
- \"repo\": \"repoKey\",
- \"urls\": [ "", "" ]
- }" http://localhost:8080/artifactory/api/plugins/execute/modifyP2Urls
- *
- */
-
-class P2UrlsConf{
+class P2UrlsConf {
     String repo
     String[] urls
 
@@ -58,11 +52,7 @@ class P2UrlsConf{
     }
 }
 
-
 executions {
-
-
-
     getP2Urls() { params ->
         def repoKey = params?.('repo')?.get(0) as String
         if (!repoKey) {
@@ -80,8 +70,10 @@ executions {
         message = new JsonBuilder(result).toPrettyString()
     }
 
-    //curl -uadmin:password -T /path/to/.json/file -X POST "http://localhost:8081/artifactory/api/plugins/execute/modifyP2Urls"
+    // curl -uadmin:password -T /path/to/.json/file -X POST "http://localhost:8081/artifactory/api/plugins/execute/modifyP2Urls"
     modifyP2Urls() { ResourceStreamHandle body ->
+        def updater = ctx.beanForType(UpdateRepoConfigHelper.class)
+        def builder = ctx.beanForType(RepoConfigModelBuilder.class)
         assert body
         def json = new JsonSlurper().parse(new InputStreamReader(body.inputStream))
         def input = new P2UrlsConf()
@@ -96,11 +88,10 @@ executions {
             return
         }
 
-        def centralConfigService = ctx.centralConfig
-        MutableCentralConfigDescriptor config = centralConfigService.mutableDescriptor
+        CentralConfigDescriptor config = ctx.centralConfig.descriptor
         def repoDescriptor = config.getVirtualRepositoriesMap()?.get(input.repo)
         // check that the repo descriptor is not NULL and that its a virtual repo. if not - return.
-        if (!repoDescriptor || !repoDescriptor.isP2Support() ) {
+        if (!repoDescriptor || repoDescriptor.type != RepoType.P2) {
             def msg = "The virtual repo ${input.repo} is not virtual or doesnt have a p2 configuration"
             log.warn(msg)
             status = 400
@@ -108,24 +99,32 @@ executions {
             return
         }
 
-        P2Configuration p2Conf = repoDescriptor?.p2
-        if (!p2Conf) {
-            def msg = "The virtual repo ${input.repo} doesnt have a P2 configuration"
-            log.warn(msg)
-            status = 400
-            message = msg
-            return
+        def model = new VirtualRepositoryConfigModel()
+        model = model.fromDescriptor(builder, repoDescriptor)
+
+        def p2Repos = Arrays.asList(input.urls).collect {
+            new P2Repo(null, null, it)
         }
-        p2Conf.setUrls(Arrays.asList(input.urls))
-        repoDescriptor.setP2(p2Conf)
-        config.getVirtualRepositoriesMap().put(repoDescriptor.key, repoDescriptor)
 
-        centralConfigService.saveEditedDescriptorAndReload(config)
+        model.typeSpecific.p2Repos = p2Repos
+        model.updateRepo(updater)
+
+        // refetch and push the config, to get rid of any invalid repos
+        config = ctx.centralConfig.descriptor
+        repoDescriptor = config.getVirtualRepositoriesMap()?.get(input.repo)
+        model = new VirtualRepositoryConfigModel()
+        model = model.fromDescriptor(builder, repoDescriptor)
+        model.updateRepo(updater)
+
+        config = ctx.centralConfig.descriptor
         status = 201
-        message = new JsonBuilder(p2Conf).toPrettyString()
+        def result = new P2UrlsConf()
+        result.repo = input.repo
+        result.urls = config.virtualRepositoriesMap?.get(input.repo)?.p2?.urls?.toArray(new String[0])
+        message = new JsonBuilder(result).toPrettyString()
 
-        //virtual repo needs to be cleand
+        // virtual repo needs to be cleaned
         def rootPath = RepoPathFactory.create(repoDescriptor.getKey(), "")
-        repositories.delete(rootPath)
+        repositories.deleteAtomic(rootPath)
     }
 }

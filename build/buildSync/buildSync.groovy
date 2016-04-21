@@ -13,20 +13,50 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-/*
- * Build Synchronization plugin replicates some build info json from one Artifactory
- * to multiple remotes Artifactory instances.
- * In this document "current server" means the Artifactory server where the plugin
- * is installed and running.
- * And "remote server" or "remote servers" defines the Artifactory servers accessed
- * via URL from this plugin. The URLs are configured either as fields in JSON to the REST
- * query or as part of the buildSync.json file.
+
+import groovy.json.JsonSlurper
+import groovyx.net.http.HTTPBuilder
+import org.apache.commons.lang.StringUtils
+import org.apache.http.HttpRequestInterceptor
+import org.apache.http.StatusLine
+import org.artifactory.addon.AddonsManager
+import org.artifactory.addon.plugin.PluginsAddon
+import org.artifactory.addon.plugin.build.AfterBuildSaveAction
+import org.artifactory.addon.plugin.build.BeforeBuildSaveAction
+import org.artifactory.api.jackson.JacksonReader
+import org.artifactory.api.rest.build.BuildInfo
+import org.artifactory.build.BuildInfoUtils
+import org.artifactory.build.BuildRun
+import org.artifactory.build.Builds
+import org.artifactory.build.DetailedBuildRun
+import org.artifactory.build.DetailedBuildRunImpl
+import org.artifactory.exception.CancelException
+import org.artifactory.storage.build.service.BuildStoreService
+import org.artifactory.storage.db.DbService
+import org.artifactory.util.HttpUtils
+import org.jfrog.build.api.Build
+import org.slf4j.Logger
+
+import java.util.concurrent.Callable
+
+import static groovyx.net.http.ContentType.BINARY
+import static groovyx.net.http.ContentType.JSON
+import static groovyx.net.http.Method.DELETE
+import static groovyx.net.http.Method.PUT
+
+/**
+ * Build Synchronization plugin replicates some build info json from one
+ * Artifactory to multiple remotes Artifactory instances. In this document
+ * "current server" means the Artifactory server where the plugin is installed
+ * and running, and "remote server" or "remote servers" defines the Artifactory
+ * servers accessed via URL from this plugin. The URLs are configured either as
+ * fields in JSON to the REST query or as part of the buildSync.json file.
  *
  * This plugin can work in 3 modes:
  * 1. Pull: Reading build info from a remote server source and adding them
  *          to the current Artifactory server.
- * 2. Push: Deploying a list of build info from the current server and adding them
- *          to the remote servers.
+ * 2. Push: Deploying a list of build info from the current server and adding
+ *          them to the remote servers.
  * 3. Event Push: Adding all (or certain) build info as they are deployed
  *          on the current server to the remote servers.
  *
@@ -46,7 +76,8 @@
  *         },
  *         ...
  *       ]
- *       Each server should have a unique key identifying it, and url/user/pass used to access the REST API.
+ *       Each server should have a unique key identifying it, and url/user/pass
+ *       used to access the REST API.
  *     1.2.2 Then list the pull replication configurations with:
  *       "pullConfigs": [
  *         {
@@ -110,49 +141,6 @@
  *
  */
 
-
-/*@Grapes([
-@Grab(group = 'org.codehaus.groovy.modules.http-builder', module = 'http-builder', version = '0.6')
-])
-@GrabExclude('commons-codec:commons-codec')
-*/
-
-import groovy.json.JsonSlurper
-import groovyx.net.http.HTTPBuilder
-import org.apache.http.HttpRequestInterceptor
-import org.apache.http.StatusLine
-
-import org.artifactory.addon.AddonsManager
-import org.artifactory.addon.plugin.PluginsAddon
-import org.artifactory.addon.plugin.build.AfterBuildSaveAction
-import org.artifactory.addon.plugin.build.BeforeBuildSaveAction
-import org.artifactory.api.jackson.JacksonReader
-import org.artifactory.api.rest.build.BuildInfo
-import org.artifactory.build.BuildRun
-import org.artifactory.build.Builds
-
-import org.artifactory.build.DetailedBuildRun
-import org.artifactory.build.DetailedBuildRunImpl
-import org.artifactory.exception.CancelException
-import org.artifactory.rest.resource.ha.BuildRunImpl
-import org.artifactory.storage.build.service.BuildStoreService
-import org.artifactory.storage.db.DbService
-import org.artifactory.util.HttpUtils
-import org.jfrog.build.api.Build
-import org.slf4j.Logger
-
-import java.util.concurrent.Callable
-
-import static groovyx.net.http.ContentType.BINARY
-import static groovyx.net.http.ContentType.JSON
-import static groovyx.net.http.Method.DELETE
-import static groovyx.net.http.Method.PUT
-
-
-
-
-
-
 def baseConfHolder = new BaseConfigurationHolder(ctx, log)
 
 executions {
@@ -176,10 +164,10 @@ executions {
             boolean force = forceS ? (forceS == "1" || forceS == "true") : false
             PullConfig pullConf = baseConf.pullConfigs[confKey]
             def res = doSync(
-                    new RemoteBuildService(pullConf.source, log),
-                    new LocalBuildService(ctx, log, pullConf.reinsert, pullConf.activatePlugins),
-                    pullConf.buildNames,
-                    pullConf.delete, max, force
+                new RemoteBuildService(pullConf.source, log, baseConf.ignoreStartDate),
+                new LocalBuildService(ctx, log, pullConf.reinsert, pullConf.activatePlugins, baseConf.ignoreStartDate),
+                pullConf.buildNames,
+                pullConf.delete, max, force
             )
             if (!res) {
                 status = 404
@@ -187,10 +175,10 @@ executions {
             } else {
                 status = 200
                 message = "Builds ${pullConf.buildNames} from ${pullConf.source.url}" +
-                        " successfully replicated:\n${res.join('\n')}\n"
+                    " successfully replicated:\n${res.join('\n')}\n"
             }
         } catch (Exception e) {
-            //aborts during execution
+            // aborts during execution
             log.error("Failed pull config", e)
             status = 500
             message = e.getMessage()
@@ -211,16 +199,18 @@ executions {
                 message = "buildSyncPushConfig needs a key params part of ${baseConf.pushConfigs.keySet()}"
                 return
             }
+            def forceS = params?.get('force')?.get(0) as String
+            boolean force = forceS ? (forceS == "1" || forceS == "true") : false
             PushConfig pushConf = baseConf.pushConfigs[confKey]
-            def localBuildService = new LocalBuildService(ctx, log, false, false)
+            def localBuildService = new LocalBuildService(ctx, log, false, false, baseConf.ignoreStartDate)
 
             List<String> res = []
             pushConf.destinations.each { destServer ->
                 res.addAll(doSync(
-                        localBuildService,
-                        new RemoteBuildService(destServer, log),
-                        pushConf.buildNames,
-                        pushConf.delete, 0, false
+                    localBuildService,
+                    new RemoteBuildService(destServer, log, baseConf.ignoreStartDate),
+                    pushConf.buildNames,
+                    pushConf.delete, 0, force
                 ))
             }
             if (!res) {
@@ -229,10 +219,10 @@ executions {
             } else {
                 status = 200
                 message = "Builds ${pushConf.buildNames} were successfully replicated" +
-                        " to ${pushConf.destinations.collect { it.url }}\n${res.join('\n')}\n"
+                    " to ${pushConf.destinations.collect { it.url }}\n${res.join('\n')}\n"
             }
         } catch (Exception e) {
-            //aborts during execution
+            // aborts during execution
             log.error("Failed pull config", e)
             status = 500
             message = e.message
@@ -247,19 +237,19 @@ build {
         if (!baseConfHolder.errors) {
             baseConf.eventPushConfigs.each { PushConfig pushConf ->
                 pushConf.buildNames.each { String buildNameFilter ->
-                    pushIfMatch(buildRun as DetailedBuildRunImpl, pushConf, buildNameFilter)
+                    pushIfMatch(buildRun as DetailedBuildRunImpl, pushConf, buildNameFilter, baseConf.ignoreStartDate)
                 }
             }
         }
     }
 }
 
-def pushIfMatch(DetailedBuildRunImpl buildRun, PushConfig pushConf, String buildNameFilter) {
+def pushIfMatch(DetailedBuildRunImpl buildRun, PushConfig pushConf, String buildNameFilter, ignoreStartDate) {
     String buildName = buildRun.name
     log.debug "Checking if ${buildRun.name} match $buildNameFilter"
     boolean match
     if (buildNameFilter.contains('*')) {
-        match = buildName.matches(buildNameFilter);
+        match = buildName.matches(buildNameFilter)
     } else {
         match = buildNameFilter.equals(buildName)
     }
@@ -267,12 +257,12 @@ def pushIfMatch(DetailedBuildRunImpl buildRun, PushConfig pushConf, String build
         pushConf.destinations.each { Server server ->
             try {
                 log.debug "Pushing ${buildRun.name}:${buildRun.number} to ${server.url}"
-                def rbs = new RemoteBuildService(server, log)
+                def rbs = new RemoteBuildService(server, log, ignoreStartDate)
                 rbs.addBuild(buildRun.build)
             } catch (Exception e) {
                 log.error(
-                        "Sending ${buildRun.name}:${buildRun.number} to ${server.url} failed with: ${e.getMessage()}",
-                        e)
+                    "Sending ${buildRun.name}:${buildRun.number} to ${server.url} failed with: ${e.getMessage()}",
+                    e)
             }
         }
     }
@@ -316,24 +306,14 @@ def doSync(BuildListBase src, BuildListBase dest, List<String> buildNames, boole
 }
 
 abstract class BuildListBase {
-    def comparator = new Comparator<BuildRun>() {
-        @Override
-        int compare(BuildRun o1, BuildRun o2) {
-            int i = o1.getStartedDate().compareTo(o2.getStartedDate())
-            if (i != 0) {
-                return i
-            }
-            i = o1.getName().compareTo(o2.getName())
-            if (i != 0) {
-                return i
-            }
-            return o1.getNumber().compareTo(o2.getNumber())
-        }
-    }
     def log
+    boolean ignoreStartDate = false
     private NavigableSet<BuildRun> _allLatestBuilds = null
 
-    BuildListBase(log) { this.log = log }
+    BuildListBase(log, ignoreStartDate) {
+        this.log = log
+        this.ignoreStartDate = ignoreStartDate as boolean
+    }
 
     NavigableSet<BuildRun> getAllLatestBuilds() {
         if (_allLatestBuilds == null) {
@@ -342,21 +322,30 @@ abstract class BuildListBase {
         return _allLatestBuilds
     }
 
-    abstract NavigableSet<BuildRun> loadAllBuilds();
+    abstract NavigableSet<BuildRun> loadAllBuilds()
+
+    protected BuildRun createBuildRunFromJson(String name, String number, String started) {
+        new BuildRunImpl(name, number, started, ignoreStartDate)
+    }
+
+    protected BuildRun createBuildRunFromDetailed(BuildRun br) {
+        new BuildRunImpl(br.getName(), br.getNumber(), br.getStarted(), ignoreStartDate)
+    }
 
     NavigableSet<BuildRun> filterBuildNames(List<String> buildNames) {
-        NavigableSet<BuildRun> result = new TreeSet<>(comparator)
+        NavigableSet<BuildRun> result = new TreeSet<>()
         buildNames.each { String buildName ->
             if (buildName.contains('*')) {
                 result.addAll(getAllLatestBuilds().findAll { it.name.matches(buildName) })
             } else {
                 BuildRun found = getAllLatestBuilds().find { it.name == buildName }
                 if (!found) {
-                    found = new BuildRunImpl(buildName, "", "")
+                    found = createBuildRunFromJson(buildName, "", "")
                 }
                 result << found
             }
         }
+        log.debug "After filter got ${result.size()} builds"
         result
     }
 
@@ -364,13 +353,13 @@ abstract class BuildListBase {
         getAllLatestBuilds().find { it.name == buildName }?.started
     }
 
-    abstract NavigableSet<BuildRun> getBuildNumbers(String buildName);
+    abstract NavigableSet<BuildRun> getBuildNumbers(String buildName)
 
-    abstract Build getBuildInfo(BuildRun b);
+    abstract Build getBuildInfo(BuildRun b)
 
-    abstract def addBuild(Build buildInfo);
+    abstract def addBuild(Build buildInfo)
 
-    abstract def deleteBuild(BuildRun buildRun);
+    abstract def deleteBuild(BuildRun buildRun)
 }
 
 class RemoteBuildService extends BuildListBase {
@@ -379,14 +368,14 @@ class RemoteBuildService extends BuildListBase {
     StatusLine lastFailure = null
     int majorVersion, minorVersion
 
-    RemoteBuildService(Server server, log) {
-        super(log)
+    RemoteBuildService(Server server, log, ignoreStartDate) {
+        super(log, ignoreStartDate)
         this.server = server
         http = new HTTPBuilder(server.url)
-        //http.auth.basic(server.user, server.password)
+        // http.auth.basic(server.user, server.password)
         http.client.addRequestInterceptor({ def httpRequest, def httpContext ->
             httpRequest.addHeader('Authorization',
-                    "Basic ${"${server.user}:${server.password}".getBytes().encodeBase64()}")
+                "Basic ${"${server.user}:${server.password}".getBytes().encodeBase64()}")
         } as HttpRequestInterceptor)
         http.handler.failure = { resp ->
             lastFailure = resp.statusLine
@@ -397,14 +386,14 @@ class RemoteBuildService extends BuildListBase {
             def v = json.version.tokenize('.')
             if (v.size() < 3) {
                 throw new CancelException("Server ${server.url} version not correct. Got ${json.text}",
-                        500)
+                    500)
             }
             majorVersion = v[0] as int
             minorVersion = v[1] as int
         }
         if (lastFailure != null) {
             throw new CancelException("Server ${server.url} version unreadable! got: ${lastFailure.reasonPhrase}",
-                    lastFailure.statusCode)
+                lastFailure.statusCode)
         }
     }
 
@@ -416,14 +405,14 @@ class RemoteBuildService extends BuildListBase {
     @Override
     NavigableSet<BuildRun> loadAllBuilds() {
         lastFailure = null
-        Set<BuildRun> result = new TreeSet<>(comparator)
+        Set<BuildRun> result = new TreeSet<>()
         log.info "Getting all builds from ${server.url}api/build"
         http.get(contentType: JSON, path: 'api/build') { resp, json ->
             json.builds.each { b ->
-                result << new BuildRunImpl(
-                        HttpUtils.decodeUri(b.uri.substring(1)),
-                        "LATEST",
-                        b.lastStarted)
+                result << createBuildRunFromJson(
+                    HttpUtils.decodeUri(b.uri.substring(1)),
+                    "LATEST",
+                    b.lastStarted as String)
             }
         }
         if (lastFailure != null) {
@@ -442,13 +431,13 @@ class RemoteBuildService extends BuildListBase {
     @Override
     NavigableSet<BuildRun> getBuildNumbers(String buildName) {
         lastFailure = null
-        Set<BuildRun> result = new TreeSet<>(comparator)
+        Set<BuildRun> result = new TreeSet<>()
         log.info "Getting all build numbers from ${server.url}api/build/$buildName"
         http.get(contentType: JSON, path: "api/build/$buildName") { resp, json ->
             json.buildsNumbers.each { b ->
-                result << new BuildRunImpl(buildName,
-                        HttpUtils.decodeUri(b.uri.substring(1)),
-                        b.started)
+                result << createBuildRunFromJson(buildName,
+                    HttpUtils.decodeUri(b.uri.substring(1)),
+                    b.started as String)
             }
         }
         if (lastFailure != null) {
@@ -472,8 +461,8 @@ class RemoteBuildService extends BuildListBase {
         log.info "Downloading JSON build info ${server.url}$uri ${queryParams}"
         Build res = null
         http.get(contentType: BINARY,
-                headers: [Accept: 'application/json'],
-                path: "$uri", query: queryParams) { resp, stream ->
+            headers: [Accept: 'application/json'],
+            path: "$uri", query: queryParams) { resp, stream ->
             res = JacksonReader.streamAsClass(stream, BuildInfo.class).buildInfo
         }
         if (lastFailure != null) {
@@ -492,8 +481,8 @@ class RemoteBuildService extends BuildListBase {
         lastFailure = null
         http.request(PUT, JSON) {
             uri.path = "api/build"
-            //JsonGenerator jsonGenerator = JacksonFactory.createJsonGenerator(outputStream);
-            //jsonGenerator.writeObject(buildInfo);
+            // JsonGenerator jsonGenerator = JacksonFactory.createJsonGenerator(outputStream)
+            // jsonGenerator.writeObject(buildInfo)
             body = buildInfo
             response.success = {
                 log.info "Successfully uploaded build ${buildInfo.name}/${buildInfo.number} : ${buildInfo.started}"
@@ -531,11 +520,11 @@ class LocalBuildService extends BuildListBase {
     boolean reinsert
     boolean activatePlugins
 
-    LocalBuildService(ctx, log, reinsert, activatePlugins) {
-        super(log)
+    LocalBuildService(ctx, log, reinsert, activatePlugins, ignoreStartDate) {
+        super(log, ignoreStartDate)
         dbService = ctx.beanForType(DbService.class)
         addonsManager = ctx.beanForType(AddonsManager.class)
-        pluginsAddon = addonsManager.addonByType(PluginsAddon.class);
+        pluginsAddon = addonsManager.addonByType(PluginsAddon.class)
         buildStoreService = ctx.beanForType(BuildStoreService.class)
         builds = ctx.beanForType(Builds.class)
         this.reinsert = reinsert
@@ -544,9 +533,9 @@ class LocalBuildService extends BuildListBase {
 
     @Override
     NavigableSet<BuildRun> loadAllBuilds() {
-        def res = new TreeSet<BuildRun>(comparator);
+        def res = new TreeSet<BuildRun>()
         res.addAll(buildStoreService.getLatestBuildsByName().collect {
-            new BuildRunImpl(it.name, "LATEST", it.started)
+            createBuildRunFromJson(it.name, "LATEST", it.started)
         })
         log.info "Found ${res.size()} builds locally"
         res
@@ -554,8 +543,8 @@ class LocalBuildService extends BuildListBase {
 
     @Override
     NavigableSet<BuildRun> getBuildNumbers(String buildName) {
-        def res = new TreeSet<BuildRun>(comparator);
-        res.addAll(buildStoreService.findBuildsByName(buildName).collect { new BuildRunImpl(it) })
+        def res = new TreeSet<BuildRun>()
+        res.addAll(buildStoreService.findBuildsByName(buildName).collect { createBuildRunFromDetailed(it) })
         log.info "Found ${res.size()} local builds named $buildName"
         res
     }
@@ -564,23 +553,23 @@ class LocalBuildService extends BuildListBase {
     def addBuild(Build buildInfo) {
         try {
             log.info "Deploying locally build ${buildInfo.name}:${buildInfo.number}:${buildInfo.started}"
-            DetailedBuildRun detailedBuildRun = new DetailedBuildRunImpl(buildInfo);
+            DetailedBuildRun detailedBuildRun = new DetailedBuildRunImpl(buildInfo)
             if (reinsert) {
                 builds.saveBuild(detailedBuildRun)
             } else {
-                dbService.invokeInTransaction("addBuild",new Callable<Object>() {
+                dbService.invokeInTransaction("addBuild", new Callable<Object>() {
                     @Override
                     public Object call() throws Exception {
                         if (activatePlugins) {
-                            pluginsAddon.execPluginActions(BeforeBuildSaveAction.class, builds, detailedBuildRun);
+                            pluginsAddon.execPluginActions(BeforeBuildSaveAction.class, builds, detailedBuildRun)
                         }
-                        buildStoreService.addBuild(buildInfo);
+                        buildStoreService.addBuild(buildInfo)
                         if (activatePlugins) {
-                            pluginsAddon.execPluginActions(AfterBuildSaveAction.class, builds, detailedBuildRun);
+                            pluginsAddon.execPluginActions(AfterBuildSaveAction.class, builds, detailedBuildRun)
                         }
-                        return null;
+                        return null
                     }
-                });
+                })
             }
         } catch (Exception e) {
             String message = "Insertion of build  ${buildInfo.name}:${buildInfo.number}:${buildInfo.started} failed due to: ${e.getMessage()}"
@@ -615,7 +604,7 @@ class BaseConfigurationHolder {
 
     BaseConfigurationHolder(ctx, log) {
         this.log = log
-        this.confFile = new File("$ctx.artifactoryHome.etcDir/plugins", "buildSync.json")
+        this.confFile = new File("${ctx.artifactoryHome.getHaAwareEtcDir()}/plugins", "buildSync.json")
     }
 
     BaseConfiguration getCurrent() {
@@ -640,8 +629,8 @@ class BaseConfigurationHolder {
             }
             if (errors) {
                 log.error(
-                        "Some validation errors appeared while parsing ${confFile.absolutePath}\n" +
-                                "${errors.join("\n")}")
+                    "Some validation errors appeared while parsing ${confFile.absolutePath}\n" +
+                        "${errors.join("\n")}")
             }
         }
         current
@@ -658,6 +647,7 @@ class BaseConfigurationHolder {
 }
 
 class BaseConfiguration {
+    boolean ignoreStartDate = false
     Map<String, Server> servers = [:]
     Map<String, PullConfig> pullConfigs = [:]
     Map<String, PushConfig> pushConfigs = [:]
@@ -668,6 +658,7 @@ class BaseConfiguration {
         try {
             reader = new FileReader(confFile)
             def slurper = new JsonSlurper().parse(reader)
+            ignoreStartDate = slurper.ignoreStartDate as boolean
             slurper.servers.each {
                 def s = new Server(it)
                 log.info "Adding Server ${s.key} : ${s.url}"
@@ -797,5 +788,100 @@ class PushConfig {
         } else {
             ""
         }
+    }
+}
+
+class BuildRunImpl implements BuildRun, Comparable<BuildRun> {
+    private final boolean ignoreStartDate;
+    private final String name;
+    private final String number;
+    private final String started;
+
+    BuildRunImpl(String name, String number, String started, boolean ignoreStartDate) {
+        this.ignoreStartDate = ignoreStartDate;
+        this.name = name;
+        this.number = number;
+        if (StringUtils.isNotBlank(started)) {
+            this.started = BuildInfoUtils.formatBuildTime(BuildInfoUtils.parseBuildTime(started));
+        } else {
+            this.started = "";
+        }
+    }
+
+    @Override
+    public String getName() {
+        return name;
+    }
+
+    @Override
+    public String getNumber() {
+        return number;
+    }
+
+    @Override
+    public String getStarted() {
+        return started;
+    }
+
+    @Override
+    public Date getStartedDate() {
+        return new Date(BuildInfoUtils.parseBuildTime(started));
+    }
+
+    @Override
+    public String getCiUrl() {
+        return null;
+    }
+
+    @Override
+    public String getReleaseStatus() {
+        return null;
+    }
+
+    @Override
+    int compareTo(BuildRun o) {
+        int i
+        if (!ignoreStartDate) {
+            i = getStartedDate().compareTo(o.getStartedDate())
+            if (i != 0) {
+                return i
+            }
+        }
+        i = name.compareTo(o.getName())
+        if (i != 0) {
+            return i
+        }
+        return number.compareTo(o.getNumber())
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        BuildRun buildRun = (BuildRun) o;
+
+        if (!ignoreStartDate && !started.equals(buildRun.started)) {
+            return false;
+        }
+        if (!name.equals(buildRun.name)) {
+            return false;
+        }
+        if (!number.equals(buildRun.number)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    @Override
+    public int hashCode() {
+        int result = name.hashCode();
+        result = 31 * result + number.hashCode();
+        if (!ignoreStartDate)
+            result = 31 * result + started.hashCode();
+        return result;
+    }
+
+    @Override
+    public String toString() {
+        return "" + name + ':' + number + ':' + started;
     }
 }

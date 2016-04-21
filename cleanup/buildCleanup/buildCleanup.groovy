@@ -13,27 +13,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import org.artifactory.repo.RepoPath
 
-//curl -f -XPOST -u admin:password "http://localhost:8080/artifactory/api/plugins/execute/cleanBuilds?params=days=50&dryRun=1"
-
-
+// curl -X POST -v -u admin:password "http://localhost:8080/artifactory/api/plugins/execute/cleanBuilds?params=days=50|dryRun"
 
 executions {
     cleanBuilds() { params ->
         def days = params['days'] ? params['days'][0] as int : 2
-        def dryRun = params['dryRun'] ? params['dryRun'][0] as boolean : true
+        def dryRun = params['dryRun'] ? params['dryRun'][0] as boolean : false
         buildCleanup(days, dryRun)
     }
 }
 
 jobs {
     buildCleanup(cron: "0 0 12 1/1 * ? *") {
-        def config = new ConfigSlurper().parse(new File("${System.properties.'artifactory.home'}/etc/plugins/buildCleanup.properties").toURI().toURL());
-        buildCleanup(config.days, config.dryRun);
+        def config = new ConfigSlurper().parse(new File("${System.properties.'artifactory.home'}/etc/plugins/buildCleanup.properties").toURI().toURL())
+        buildCleanup(config.days, config.dryRun)
     }
 }
-
 
 private def buildCleanup(int days, dryRun) {
     if (dryRun) {
@@ -41,34 +37,22 @@ private def buildCleanup(int days, dryRun) {
     } else {
         echo "Starting build cleanup older than $days days..."
     }
-    /*
-    WARNING: UNSUPPORTED INTERNAL API USAGE!
-     */
-    //TODO: Remove this and replace with the following line once the new build.buildNames API is available
-    /*List<String> buildNames = ctx.beanForType(
-            org.artifactory.storage.build.service.BuildStoreService).getAllBuildNames()*/
-
-    // Below is available only from Artifactory 3.2.0, see: https://www.jfrog.com/jira/browse/RTFACT-5942
     List<String> buildNames = builds.buildNames
 
     def n = 0
     buildNames.each { buildName ->
         builds.getBuilds(buildName, null, null).each {
             def before = new Date() - days
-            //log.warn "Found build $buildName#$it.number: $it.startedDate"
+            // log.warn "Found build $buildName#$it.number: $it.startedDate"
             if (it.startedDate.before(before)) {
                 if (dryRun) {
-                    log.info "Found $it";
+                    log.info "Found $it"
                     echo "**DryRun** Deleting build: $buildName#$it.number ($it.startedDate)"
                 } else {
                     echo "Deleting build: $buildName#$it.number ($it.startedDate)"
                     builds.deleteBuild it
                 }
-
-                if (!dryRun) {
-
-                }
-                n++;
+                n++
             }
         }
     }
@@ -77,7 +61,6 @@ private def buildCleanup(int days, dryRun) {
     } else {
         echo "Finished build cleanup older than $days days. $n builds were deleted."
     }
-
 }
 
 private void echo(msg) {

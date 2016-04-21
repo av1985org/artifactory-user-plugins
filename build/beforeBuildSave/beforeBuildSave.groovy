@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 JFrog Ltd.
+ * Copyright (C) 2014 JFrog Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,13 +19,14 @@ import org.jfrog.build.api.Build
 
 build {
     beforeSave { DetailedBuildRun buildRun ->
-        log.debug "Checking if ${buildRun.name} should be modified before saving!"
+        log.debug("Checking if ${buildRun.name} should be modified before" +
+                  " saving!")
         Build build = buildRun.build
         build.modules.each { m ->
             m.artifacts.each { a ->
                 def type = a.getType()
                 if (type.contains(';')) {
-                    a.setType(type.substring(0,type.indexOf(';')))
+                    a.setType(type.substring(0, type.indexOf(';')))
                 }
             }
         }
